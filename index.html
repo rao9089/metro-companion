@@ -32,6 +32,9 @@
         .progress { height: 12px; background: #e0e4eb; border-radius: 10px; overflow: hidden; margin-top: 10px; }
         .progress-bar { height: 100%; width: 0%; background: #16803c; transition: width 0.2s; }
         .hidden { display: none; }
+        .flash { animation: flash 0.5s 6; }
+        @keyframes flash { 50% { background: #b00020; } }
+        @media (prefers-reduced-motion: reduce) { .flash { animation-duration: 1s; animation-iteration-count: 2; } }
     </style>
 </head>
 <body>
@@ -63,6 +66,16 @@
     </div>
 
     <div class="panel">
+        <h2>Live GPS</h2>
+        <button class="primary" id="gpsButton">Start Live GPS</button>
+        <button class="reset" id="stopGpsButton" disabled>Stop Live GPS</button>
+        <button class="secondary" id="downloadLogButton">Download GPS Log</button>
+        <div id="gpsStatus" class="status">GPS not started.</div>
+        <p class="note">Keep this page open with the screen on. GPS stops if the screen locks or you switch apps.
+        Underground sections may have no GPS. Use Simulate Next Station manually there.</p>
+    </div>
+
+    <div class="panel">
         <h2>Stations on Your Journey</h2>
         <ol id="stationList" class="station-list"></ol>
     </div>
@@ -70,9 +83,9 @@
     <div class="panel">
         <h2>Important Limitations</h2>
         <p class="note">
-            This is a demonstration using simulated station movements.
-            It does not use live GPS, real train tracking, or metro announcements.
-            It does not yet provide reliable background or locked-screen alerts.
+            This is a test version. Live GPS uses straight-line distance to station coordinates
+            and may be late, early or unavailable, especially underground.
+            It does not use metro announcements and does not work while the screen is locked.
             Always check your actual location before leaving the train.
         </p>
     </div>
@@ -94,12 +107,24 @@
     const nextText = document.getElementById("nextText");
     const lineText = document.getElementById("lineText");
     const stationList = document.getElementById("stationList");
+    const gpsButton = document.getElementById("gpsButton");
+    const stopGpsButton = document.getElementById("stopGpsButton");
+    const downloadLogButton = document.getElementById("downloadLogButton");
+    const gpsStatus = document.getElementById("gpsStatus");
+
+    // ---------- Live GPS settings ----------
+    const GPS_MAX_ACCURACY = 100;   // metres: readings worse than this are ignored
+    const ARRIVE_RADIUS = 150;      // metres: within this distance counts as "at station"
+    const CONFIRM_READINGS = 2;     // good readings in a row needed to confirm a station
+    const LOOK_AHEAD = 3;           // stations ahead to check (recovers after GPS gaps)
 
     // ---------- Build network: station -> neighbouring stations with line ----------
-    const adjacency = {};
+    const adjacency = {};           // station name -> list of {to, line}
+    const stationCoords = {};       // station name -> {lat, lon}
     METRO_LINES.forEach(function (line) {
         for (let i = 0; i < line.stations.length; i++) {
             const name = line.stations[i].name;
+            stationCoords[name] = { lat: line.stations[i].lat, lon: line.stations[i].lon };
             if (!adjacency[name]) { adjacency[name] = []; }
             if (i > 0) { adjacency[name].push({ to: line.stations[i - 1].name, line: line }); }
             if (i < line.stations.length - 1) { adjacency[name].push({ to: line.stations[i + 1].name, line: line }); }
@@ -108,10 +133,17 @@
     const allStations = Object.keys(adjacency).sort();
 
     // ---------- Journey state ----------
-    let path = [];          // ordered station names
-    let segments = [];      // segments[i] = travel from path[i] to path[i+1]
-    let currentIndex = 0;   // index of current station in path
+    let path = [];              // ordered station names
+    let segments = [];          // segments[i] = travel from path[i] to path[i+1]
+    let currentIndex = 0;       // index of current station in path
     let journeyStarted = false;
+
+    // ---------- GPS state ----------
+    let gpsWatchId = null;      // id of the running GPS watch
+    let wakeLock = null;        // keeps the screen on
+    let candidateIndex = -1;    // station currently being confirmed
+    let candidateCount = 0;     // readings in a row near that station
+    let gpsLog = [];            // CSV lines for download
 
     // ---------- Shortest route by number of stops (breadth-first search) ----------
     function findPath(origin, destination) {
@@ -168,6 +200,14 @@
     }
 
     function hideAlert() { alertBox.className = "alert hidden"; alertBox.textContent = ""; }
+
+    // Flash the screen red when an alert is showing
+    function flashScreen() {
+        if (alertBox.classList.contains("hidden")) { return; }
+        document.body.classList.remove("flash");
+        void document.body.offsetWidth;
+        document.body.classList.add("flash");
+    }
 
     function fillStationOptions() {
         allStations.forEach(function (name) {
@@ -227,7 +267,7 @@
         hideAlert();
         if (currentIndex === last) {
             showAlert("YOU HAVE REACHED YOUR DESTINATION: " + path[last], "arrived");
-            showMessage("Demo complete.");
+            showMessage("Journey complete.");
             nextButton.disabled = true;
             return;
         }
@@ -249,7 +289,133 @@
         showMessage("Travelling on " + segments[currentIndex].line.name + ".");
     }
 
+    // ---------- Straight-line distance in metres (same formula as the Python scripts) ----------
+    function distanceMetres(lat1, lon1, lat2, lon2) {
+        const r = 6371000;
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a = Math.sin(dLat / 2) ** 2 +
+                  Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+        return 2 * r * Math.asin(Math.sqrt(a));
+    }
+
+    // ---------- Ask the phone to keep the screen on ----------
+    async function keepScreenOn() {
+        try {
+            if ("wakeLock" in navigator) { wakeLock = await navigator.wakeLock.request("screen"); }
+        } catch (e) { /* not supported - user must keep screen on manually */ }
+    }
+
+    // Re-request screen lock when returning to the page
+    document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible" && gpsWatchId !== null) { keepScreenOn(); }
+    });
+
+    // ---------- Called for every GPS reading ----------
+    function handlePosition(position) {
+        if (!journeyStarted) { return; }
+        const lat = position.coords.latitude;
+        const lon = position.coords.longitude;
+        const accuracy = position.coords.accuracy;
+        const time = new Date(position.timestamp);
+
+        // Distance to the next station on the route
+        let nextDistance = null;
+        if (currentIndex < path.length - 1) {
+            const n = stationCoords[path[currentIndex + 1]];
+            nextDistance = distanceMetres(lat, lon, n.lat, n.lon);
+        }
+
+        // Log every reading
+        gpsLog.push([time.toISOString(), lat.toFixed(6), lon.toFixed(6), Math.round(accuracy),
+                     '"' + path[currentIndex] + '"', nextDistance === null ? "" : Math.round(nextDistance)].join(","));
+
+        // Show status
+        let text = time.toLocaleTimeString() + " | accuracy " + Math.round(accuracy) + " m";
+        if (nextDistance !== null) { text += " | " + Math.round(nextDistance) + " m to " + path[currentIndex + 1]; }
+        text += " | readings logged: " + gpsLog.length;
+
+        // Ignore weak readings
+        if (accuracy > GPS_MAX_ACCURACY) {
+            gpsStatus.textContent = text + " | WEAK SIGNAL - position not used";
+            return;
+        }
+        gpsStatus.textContent = text;
+
+        // Look for the first station ahead within the arrive radius
+        let found = -1;
+        const lastCheck = Math.min(currentIndex + LOOK_AHEAD, path.length - 1);
+        for (let i = currentIndex + 1; i <= lastCheck; i++) {
+            const c = stationCoords[path[i]];
+            if (distanceMetres(lat, lon, c.lat, c.lon) <= ARRIVE_RADIUS) { found = i; break; }
+        }
+
+        // Not near any station ahead
+        if (found === -1) { candidateIndex = -1; candidateCount = 0; return; }
+
+        // Count readings in a row near the same station
+        if (found === candidateIndex) { candidateCount++; } else { candidateIndex = found; candidateCount = 1; }
+
+        // Confirm station change
+        if (candidateCount >= CONFIRM_READINGS) {
+            currentIndex = found;
+            candidateIndex = -1;
+            candidateCount = 0;
+            updateProgress();
+            updateStationList();
+            evaluateAlerts();
+            flashScreen();
+            if (currentIndex >= path.length - 1) { stopGps(); }
+        }
+    }
+
+    // ---------- GPS errors ----------
+    function handleGpsError(error) {
+        if (error.code === 1) {
+            gpsStatus.textContent = "Location permission denied. iPhone Settings > Chrome > Location > While Using the App.";
+            stopGps();
+        } else if (error.code === 2) {
+            gpsStatus.textContent = "No GPS signal (underground?). Use Simulate Next Station manually.";
+        } else {
+            gpsStatus.textContent = "GPS timeout - still trying...";
+        }
+    }
+
+    function startGps() {
+        if (!journeyStarted) { gpsStatus.textContent = "Press Start Journey first."; return; }
+        if (!navigator.geolocation) { gpsStatus.textContent = "GPS not supported in this browser."; return; }
+        if (gpsWatchId !== null) { return; }
+        gpsWatchId = navigator.geolocation.watchPosition(handlePosition, handleGpsError,
+            { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+        keepScreenOn();
+        gpsButton.disabled = true;
+        stopGpsButton.disabled = false;
+        gpsStatus.textContent = "Waiting for GPS...";
+    }
+
+    function stopGps() {
+        if (gpsWatchId !== null) { navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; }
+        if (wakeLock) { wakeLock.release(); wakeLock = null; }
+        candidateIndex = -1;
+        candidateCount = 0;
+        gpsButton.disabled = false;
+        stopGpsButton.disabled = true;
+    }
+
+    // ---------- Download the GPS log as CSV ----------
+    function downloadLog() {
+        if (gpsLog.length === 0) { gpsStatus.textContent = "No GPS readings logged yet."; return; }
+        const csv = "time,lat,lon,accuracy_m,current_station,distance_to_next_m\n" + gpsLog.join("\n");
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+        link.download = "metro_gps_log.csv";
+        link.click();
+    }
+
+    // ---------- Reset ----------
     function resetJourney() {
+        stopGps();
+        gpsLog = [];
         path = []; segments = []; currentIndex = 0; journeyStarted = false;
         nextButton.disabled = true;
         hideAlert();
@@ -259,6 +425,7 @@
         nextText.textContent = "Next station: Not available";
         lineText.textContent = "Line: Not available";
         stationList.innerHTML = "";
+        gpsStatus.textContent = "GPS not started.";
         showMessage("Select your starting station and destination.");
     }
 
@@ -283,12 +450,19 @@
     nextButton.addEventListener("click", function () {
         if (!journeyStarted || currentIndex >= path.length - 1) { return; }
         currentIndex++;
+        candidateIndex = -1;
+        candidateCount = 0;
         updateProgress();
         updateStationList();
         evaluateAlerts();
+        flashScreen();
+        if (currentIndex >= path.length - 1) { stopGps(); }
     });
 
     resetButton.addEventListener("click", resetJourney);
+    gpsButton.addEventListener("click", startGps);
+    stopGpsButton.addEventListener("click", stopGps);
+    downloadLogButton.addEventListener("click", downloadLog);
 
     // ---------- Start-up ----------
     fillStationOptions();
