@@ -32,6 +32,10 @@
         .progress { height: 12px; background: #e0e4eb; border-radius: 10px; overflow: hidden; margin-top: 10px; }
         .progress-bar { height: 100%; width: 0%; background: #16803c; transition: width 0.2s; }
         .hidden { display: none; }
+        .live-banner { position: sticky; top: 0; z-index: 10; background: #174ea6; color: white; padding: 14px 18px; border-radius: 12px; margin-bottom: 16px; border-left: 10px solid #174ea6; box-shadow: 0 3px 10px #00000030; }
+        .live-label { display: block; font-size: 14px; opacity: 0.85; }
+        .live-name { display: block; font-size: 26px; font-weight: bold; margin-bottom: 8px; line-height: 1.2; }
+        .live-name.next { color: #ffe082; margin-bottom: 0; }
         .flash { animation: flash 0.5s 6; }
         @keyframes flash { 50% { background: #b00020; } }
         @media (prefers-reduced-motion: reduce) { .flash { animation-duration: 1s; animation-iteration-count: 2; } }
@@ -42,6 +46,13 @@
 
     <h1>Metro Companion</h1>
     <div class="subtitle">A visual travel assistant for deaf and hard-of-hearing passengers</div>
+
+    <div id="liveBanner" class="live-banner hidden" aria-live="polite">
+        <span class="live-label">Current station</span>
+        <span id="bannerCurrent" class="live-name">—</span>
+        <span class="live-label">Next station</span>
+        <span id="bannerNext" class="live-name next">—</span>
+    </div>
 
     <div class="panel">
         <h2>Plan Your Journey</h2>
@@ -111,6 +122,9 @@
     const stopGpsButton = document.getElementById("stopGpsButton");
     const downloadLogButton = document.getElementById("downloadLogButton");
     const gpsStatus = document.getElementById("gpsStatus");
+    const liveBanner = document.getElementById("liveBanner");
+    const bannerCurrent = document.getElementById("bannerCurrent");
+    const bannerNext = document.getElementById("bannerNext");
 
     // ---------- Live GPS settings ----------
     const GPS_MAX_ACCURACY = 100;   // metres: readings worse than this are ignored
@@ -252,12 +266,17 @@
         progressText.textContent = "Station " + (currentIndex + 1) + " of " + path.length + " | " + percentage + "% complete";
         progressBar.style.width = percentage + "%";
         currentText.textContent = "Current station: " + path[currentIndex];
+        bannerCurrent.textContent = path[currentIndex];
+        liveBanner.classList.remove("hidden");
         if (currentIndex < total) {
             nextText.textContent = "Next station: " + path[currentIndex + 1];
             lineText.textContent = "Line: " + segments[currentIndex].line.name + " towards " + segments[currentIndex].towards;
+            bannerNext.textContent = path[currentIndex + 1];
+            liveBanner.style.borderLeftColor = segments[currentIndex].line.color;
         } else {
             nextText.textContent = "Next station: Journey completed";
             lineText.textContent = "Line: —";
+            bannerNext.textContent = "You have arrived";
         }
     }
 
@@ -425,6 +444,7 @@
         nextText.textContent = "Next station: Not available";
         lineText.textContent = "Line: Not available";
         stationList.innerHTML = "";
+        liveBanner.classList.add("hidden");
         gpsStatus.textContent = "GPS not started.";
         showMessage("Select your starting station and destination.");
     }
