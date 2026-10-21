@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metro Companion</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background: #f2f5f9; color: #172033; }
+        .container { max-width: 650px; margin: auto; }
+        h1 { text-align: center; color: #174ea6; margin-bottom: 5px; }
+        .subtitle { text-align: center; color: #555; margin-bottom: 20px; }
+        .panel { background: white; padding: 18px; margin-bottom: 16px; border-radius: 12px; box-shadow: 0 2px 7px #00000012; }
+        label { display: block; font-weight: bold; margin-top: 12px; margin-bottom: 6px; }
+        select, button { width: 100%; padding: 13px; font-size: 16px; border-radius: 8px; }
+        select { border: 1px solid #aab4c3; background: white; }
+        button { border: none; margin-top: 10px; cursor: pointer; font-weight: bold; }
+        button:disabled { opacity: 0.5; }
+        button:focus, select:focus { outline: 3px solid #fbbc04; }
+        .primary { background: #174ea6; color: white; }
+        .secondary { background: #e5edfa; color: #174ea6; }
+        .reset { background: #eeeeee; color: #222; }
+        .status { padding: 15px; background: #e8f0fe; border-radius: 8px; margin-top: 12px; line-height: 1.6; }
+        .alert { background: #fff0c2; border: 2px solid #b77900; color: #593b00; padding: 18px; border-radius: 10px; margin-top: 12px; font-size: 20px; font-weight: bold; text-align: center; }
+        .alert.change { background: #ffe0e0; border-color: #b00020; color: #6b0012; }
+        .alert.arrived { background: #dcf5e3; border-color: #16803c; color: #0b4d22; }
+        .station-list { list-style: none; padding: 0; margin: 0; }
+        .station-list li { padding: 11px; border-bottom: 1px solid #e1e5eb; border-left: 8px solid #ccc; }
+        .station-list li.current { background: #dbeafe; font-weight: bold; }
+        .station-list li.interchange { font-weight: bold; }
+        .note { font-size: 14px; line-height: 1.6; color: #555; }
+        .progress { height: 12px; background: #e0e4eb; border-radius: 10px; overflow: hidden; margin-top: 10px; }
+        .progress-bar { height: 100%; width: 0%; background: #16803c; transition: width 0.2s; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <h1>Metro Companion</h1>
+    <div class="subtitle">A visual travel assistant for deaf and hard-of-hearing passengers</div>
+
+    <div class="panel">
+        <h2>Plan Your Journey</h2>
+        <label for="origin">Starting station</label>
+        <select id="origin"></select>
+        <label for="destination">Destination station</label>
+        <select id="destination"></select>
+        <button class="primary" id="startButton">Start Journey</button>
+        <button class="secondary" id="nextButton" disabled>Simulate Next Station</button>
+        <button class="reset" id="resetButton">Reset Demo</button>
+        <div id="message" class="status" role="status" aria-live="polite">Select your starting station and destination.</div>
+        <div id="alert" class="alert hidden" role="alert" aria-live="assertive"></div>
+    </div>
+
+    <div class="panel">
+        <h2>Journey Progress</h2>
+        <div id="progressText">Journey not started</div>
+        <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+        <p id="currentText">Current station: Not started</p>
+        <p id="nextText">Next station: Not available</p>
+        <p id="lineText">Line: Not available</p>
+    </div>
+
+    <div class="panel">
+        <h2>Stations on Your Journey</h2>
+        <ol id="stationList" class="station-list"></ol>
+    </div>
+
+    <div class="panel">
+        <h2>Important Limitations</h2>
+        <p class="note">
+            This is a demonstration using simulated station movements.
+            It does not use live GPS, real train tracking, or metro announcements.
+            It does not yet provide reliable background or locked-screen alerts.
+            Always check your actual location before leaving the train.
+        </p>
+    </div>
+</div>
+
+<script src="metro_data.js"></script>
+<script>
+    // ---------- Page elements ----------
+    const originSelect = document.getElementById("origin");
+    const destinationSelect = document.getElementById("destination");
+    const startButton = document.getElementById("startButton");
+    const nextButton = document.getElementById("nextButton");
+    const resetButton = document.getElementById("resetButton");
+    const message = document.getElementById("message");
+    const alertBox = document.getElementById("alert");
+    const progressText = document.getElementById("progressText");
+    const progressBar = document.getElementById("progressBar");
+    const currentText = document.getElementById("currentText");
+    const nextText = document.getElementById("nextText");
+    const lineText = document.getElementById("lineText");
+    const stationList = document.getElementById("stationList");
+
+    // ---------- Build network: station -> neighbouring stations with line ----------
+    const adjacency = {};
+    METRO_LINES.forEach(function (line) {
+        for (let i = 0; i < line.stations.length; i++) {
+            const name = line.stations[i].name;
+            if (!adjacency[name]) { adjacency[name] = []; }
+            if (i > 0) { adjacency[name].push({ to: line.stations[i - 1].name, line: line }); }
+            if (i < line.stations.length - 1) { adjacency[name].push({ to: line.stations[i + 1].name, line: line }); }
+        }
+    });
+    const allStations = Object.keys(adjacency).sort();
+
+    // ---------- Journey state ----------
+    let path = [];          // ordered station names
+    let segments = [];      // segments[i] = travel from path[i] to path[i+1]
+    let currentIndex = 0;   // index of current station in path
+    let journeyStarted = false;
+
+    // ---------- Shortest route by number of stops (breadth-first search) ----------
+    function findPath(origin, destination) {
+        const previous = {};
+        previous[origin] = null;
+        const queue = [origin];
+        while (queue.length > 0) {
+            const current = queue.shift();
+            if (current === destination) { break; }
+            adjacency[current].forEach(function (edge) {
+                if (!(edge.to in previous)) { previous[edge.to] = current; queue.push(edge.to); }
+            });
+        }
+        if (!(destination in previous)) { return null; }
+        const result = [];
+        let node = destination;
+        while (node !== null) { result.unshift(node); node = previous[node]; }
+        return result;
+    }
+
+    // ---------- Terminal station in the direction of travel ----------
+    function towards(line, fromName, toName) {
+        const names = line.stations.map(function (s) { return s.name; });
+        return names.indexOf(toName) > names.indexOf(fromName) ? names[names.length - 1] : names[0];
+    }
+
+    // ---------- Assign a line to each segment (stay on same line where possible) ----------
+    function buildSegments(stationPath) {
+        const result = [];
+        let previousLine = null;
+        for (let i = 0; i < stationPath.length - 1; i++) {
+            const options = adjacency[stationPath[i]]
+                .filter(function (e) { return e.to === stationPath[i + 1]; })
+                .map(function (e) { return e.line; });
+            let line = options[0];
+            if (previousLine && options.indexOf(previousLine) >= 0) { line = previousLine; }
+            result.push({ from: stationPath[i], to: stationPath[i + 1], line: line, towards: towards(line, stationPath[i], stationPath[i + 1]) });
+            previousLine = line;
+        }
+        return result;
+    }
+
+    // ---------- Is station at index i a change point? ----------
+    function isInterchange(i) {
+        return i > 0 && i < path.length - 1 && segments[i - 1].line !== segments[i].line;
+    }
+
+    // ---------- Helpers ----------
+    function showMessage(text) { message.textContent = text; }
+
+    function showAlert(text, type) {
+        alertBox.textContent = text;
+        alertBox.className = "alert" + (type ? " " + type : "");
+    }
+
+    function hideAlert() { alertBox.className = "alert hidden"; alertBox.textContent = ""; }
+
+    function fillStationOptions() {
+        allStations.forEach(function (name) {
+            originSelect.add(new Option(name, name));
+            destinationSelect.add(new Option(name, name));
+        });
+        if (allStations.indexOf("Sri Sathya Sai Hospital") >= 0) { originSelect.value = "Sri Sathya Sai Hospital"; }
+        if (allStations.indexOf("Mahatma Gandhi Road") >= 0) { destinationSelect.value = "Mahatma Gandhi Road"; }
+    }
+
+    function routeSummary() {
+        const parts = [];
+        segments.forEach(function (seg, i) {
+            if (i === 0 || seg.line !== segments[i - 1].line) {
+                if (i > 0) { parts.push("change at " + seg.from); }
+                parts.push(seg.line.name + " towards " + seg.towards);
+            }
+        });
+        return parts.join(" → ");
+    }
+
+    function updateStationList() {
+        stationList.innerHTML = "";
+        path.forEach(function (name, i) {
+            const item = document.createElement("li");
+            const seg = i < segments.length ? segments[i] : segments[segments.length - 1];
+            item.style.borderLeftColor = seg.line.color;
+            item.textContent = (i + 1) + ". " + name;
+            if (isInterchange(i)) {
+                item.classList.add("interchange");
+                item.textContent += " — CHANGE TO " + segments[i].line.name.toUpperCase();
+            }
+            if (i === path.length - 1) { item.textContent += " — DESTINATION"; }
+            if (i === currentIndex && journeyStarted) { item.classList.add("current"); item.textContent += " — YOU ARE HERE"; }
+            stationList.appendChild(item);
+        });
+    }
+
+    function updateProgress() {
+        const total = path.length - 1;
+        const percentage = Math.round((currentIndex / total) * 100);
+        progressText.textContent = "Station " + (currentIndex + 1) + " of " + path.length + " | " + percentage + "% complete";
+        progressBar.style.width = percentage + "%";
+        currentText.textContent = "Current station: " + path[currentIndex];
+        if (currentIndex < total) {
+            nextText.textContent = "Next station: " + path[currentIndex + 1];
+            lineText.textContent = "Line: " + segments[currentIndex].line.name + " towards " + segments[currentIndex].towards;
+        } else {
+            nextText.textContent = "Next station: Journey completed";
+            lineText.textContent = "Line: —";
+        }
+    }
+
+    // ---------- Decide which alert to show at the current station ----------
+    function evaluateAlerts() {
+        const last = path.length - 1;
+        hideAlert();
+        if (currentIndex === last) {
+            showAlert("YOU HAVE REACHED YOUR DESTINATION: " + path[last], "arrived");
+            showMessage("Demo complete.");
+            nextButton.disabled = true;
+            return;
+        }
+        if (isInterchange(currentIndex)) {
+            showAlert("CHANGE TRAINS HERE at " + path[currentIndex] + ". Take " + segments[currentIndex].line.name + " towards " + segments[currentIndex].towards + ".", "change");
+            showMessage("Interchange: leave this train and change lines.");
+            return;
+        }
+        if (currentIndex === last - 1) {
+            showAlert("GET READY! NEXT STATION IS YOUR DESTINATION: " + path[last], "");
+            showMessage("Destination warning: prepare to get off at the next station.");
+            return;
+        }
+        if (isInterchange(currentIndex + 1)) {
+            showAlert("GET READY! CHANGE TRAINS AT NEXT STATION: " + path[currentIndex + 1], "");
+            showMessage("Interchange warning: prepare to get off at the next station.");
+            return;
+        }
+        showMessage("Travelling on " + segments[currentIndex].line.name + ".");
+    }
+
+    function resetJourney() {
+        path = []; segments = []; currentIndex = 0; journeyStarted = false;
+        nextButton.disabled = true;
+        hideAlert();
+        progressText.textContent = "Journey not started";
+        progressBar.style.width = "0%";
+        currentText.textContent = "Current station: Not started";
+        nextText.textContent = "Next station: Not available";
+        lineText.textContent = "Line: Not available";
+        stationList.innerHTML = "";
+        showMessage("Select your starting station and destination.");
+    }
+
+    // ---------- Buttons ----------
+    startButton.addEventListener("click", function () {
+        resetJourney();
+        const origin = originSelect.value;
+        const destination = destinationSelect.value;
+        if (origin === destination) { showMessage("Starting station and destination must be different."); return; }
+        const found = findPath(origin, destination);
+        if (!found) { showMessage("No route found between these stations."); return; }
+        path = found;
+        segments = buildSegments(path);
+        journeyStarted = true;
+        nextButton.disabled = false;
+        updateProgress();
+        updateStationList();
+        evaluateAlerts();
+        showMessage("Route: " + routeSummary());
+    });
+
+    nextButton.addEventListener("click", function () {
+        if (!journeyStarted || currentIndex >= path.length - 1) { return; }
+        currentIndex++;
+        updateProgress();
+        updateStationList();
+        evaluateAlerts();
+    });
+
+    resetButton.addEventListener("click", resetJourney);
+
+    // ---------- Start-up ----------
+    fillStationOptions();
+    resetJourney();
+</script>
+</body>
+</html>
